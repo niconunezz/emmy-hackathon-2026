@@ -1,7 +1,7 @@
 from __future__ import annotations
 from collections import defaultdict
 from enum import Enum, auto
-from typing import Any, NamedTuple, Optional, Sequence, Union
+from typing import Any, NamedTuple, Optional, Sequence, Union, List
 
 
 class PTXOpTy(Enum):
@@ -13,15 +13,25 @@ class PTXOpTy(Enum):
     SHL = auto()
     RELU = auto()
     IF = auto()     
-
+    MOV = auto()
+    LOOP = auto()
+    BRANCH = auto()
+    SHFL = auto()
 
 class COND(Enum):
     GT = auto()
+    GE = auto()
+    NE = auto()
 
 class Register(NamedTuple):
     nm: str          
     dtype: str       
 
+class Smem(NamedTuple):
+    nm : str
+    size : int
+    dtype : str
+    align : int
 
 Operand = Union[Register, int, float]
 
@@ -30,6 +40,47 @@ class PTXInstr(NamedTuple):
     ins: Sequence[Any]
     outs: Optional[Register]
     args: Optional[dict] = None
+
+class Block:
+    def __init__(self, name, id):
+        self.name : str = name
+        self.id : int = id
+        self.guard : PTXInstr|None = None
+        self.ins : list = []
+
+    def add(self, instr: PTXInstr):
+        self.ins.append(instr)
+
+
+class BlockManager:
+    def __init__(self):
+        init_block = Block("BLOCK0", 0)
+        self.curr_block = init_block
+        self.blocks = [init_block]
+        self.n_blocks = len(self.blocks)
+        
+    def new_block(self):
+        new_id = self.blocks[-1].id + 1
+        new_nm = "BLOCK" + str(new_id)
+        new_block = Block(new_nm, new_id)
+        self.blocks.append(new_block)
+        self.curr_block = new_block
+        return new_block
+
+    def get_next_block(self):
+        assert(self.n_blocks > self.curr_block.id + 1), "There is no next block"
+        return self.blocks[self.curr_block.id + 1]
+
+    def get_prev_block(self, i=1):
+        assert(self.curr_block.id - i >= 0), f"prev block -{i} does not exist"
+        return self.blocks[self.curr_block.id - i]
+
+    def serialize(self):
+        ins = [block.ins for block in self.blocks]
+        return {b: ins for b, ins in zip(self.blocks, ins)}
+
+    
+
 
 
 def reg_class(dtype: str) -> str:
@@ -51,6 +102,7 @@ class PTXAssembly:
         # with loops or several guarded blocks a cached register may not dominate its reuse.
         self.bin_expr_cache: dict = {}
         self.name_to_reg = self._init_params(signature)
+        self.smem_instr : List[Smem] = [] 
 
     def _init_params(self, signature: dict[str, str]) -> dict[str, Register]:
         # %rd0 to %rdN-1 are scratch registers for ld.param
@@ -58,6 +110,8 @@ class PTXAssembly:
             self.new_reg(dtype)
         # the next N hold the cvta.to.global result of each kernel argument.
         return {name: self.new_reg(dtype) for name, dtype in signature.items()}
+
+    
 
     def _alloc(self, prefix: str, dtype: str) -> Register:
         reg = Register(f"%{prefix}{self.reg_cnt[prefix]}", dtype)

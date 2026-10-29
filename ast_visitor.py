@@ -2,17 +2,14 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from meta import MetaStruct
-from ptx_ir import COND, PTXAssembly, PTXInstr, PTXOpTy, Register
+from ptx_ir import COND, PTXAssembly, PTXInstr, PTXOpTy, Register, Smem, BlockManager
+from utils import _nbytes, LITERAL_DTYPE
 
 log = logging.getLogger(__name__)
 
-LITERAL_DTYPE = {int: "u32", float: "f32"}
-DTYPE_BYTES = {"f32": 4}
-BIN_OPS = {"+": PTXOpTy.ADD, "*": PTXOpTy.MUL}
+# note for COND methods we use the inverse because of how we create blocks
+BIN_OPS = {"+": PTXOpTy.ADD, "*": PTXOpTy.MUL, "==" : COND.NE}
 ELEMENTWISE_OPS = {"add": PTXOpTy.ADD, "multiply": PTXOpTy.MUL, "relu": PTXOpTy.RELU}
-
-def _dtype_of(operand) -> str:
-    return operand.dtype if isinstance(operand, Register) else LITERAL_DTYPE[type(operand)]
 
 
 def dtype_from_bin_expr(lhs, rhs) -> str:
@@ -20,11 +17,8 @@ def dtype_from_bin_expr(lhs, rhs) -> str:
     bits = max(int(lhs_dtype[1:]), int(_dtype_of(rhs)[1:]))
     return ("f" if lhs_dtype[0] == "f" else "u") + str(bits)
 
-def _nbytes(dtype: str) -> int:
-    try:
-        return DTYPE_BYTES[dtype]
-    except KeyError:
-        raise NotImplementedError(f"element size of dtype {dtype!r}") from None
+def _dtype_of(operand) -> str:
+    return operand.dtype if isinstance(operand, Register) else LITERAL_DTYPE[type(operand)]
 
 def _is_power_of_two(n) -> bool:
     return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0
@@ -33,10 +27,8 @@ class NodeVisitor:
     def __init__(self, ctx: PTXAssembly, mstruct: MetaStruct):
         self.ctx = ctx
         self.mstruct = mstruct
-        self.ins: dict[str, list[PTXInstr]] = defaultdict(list)   # block name -> instructions set
-        self.curr_block = "block0"
-        self.block_cnt = 0
-
+        self.bman = BlockManager()
+  
     # node type dispatch ---------------------
 
     def visit(self, node):
@@ -47,7 +39,7 @@ class NodeVisitor:
         log.warning("no lowering for %s", type(node).__name__)
 
     def _emit(self, instr: PTXInstr) -> None:
-        self.ins[self.curr_block].append(instr)
+        self.bman.curr_block.add(instr)
 
     # containers ---------------
 
@@ -93,11 +85,14 @@ class NodeVisitor:
     # pid --------------------------------------------------
     def visit_Axis(self, node):
         ctx = self.ctx
-        ctaid, ntid, tid = (ctx.new_reg("u32") for _ in range(3))
+        ctaid, ntid, tid, lane, warp = (ctx.new_reg("u32") for _ in range(5))
+        ctx.name_to_reg["lane"] = lane
+        ctx.name_to_reg["warp"] = warp
+        
         pid = ctx.new_reg("u32")
         ctx.pid_var_nm = node.name
         ctx.name_to_reg[node.name] = pid
-        self._emit(PTXInstr(PTXOpTy.PID, (ctaid, ntid, tid), pid))
+        self._emit(PTXInstr(PTXOpTy.PID, (ctaid, ntid, tid, lane, warp), pid))
 
         extent = self.visit(node.extent)
         launched = self.mstruct.total_threads
@@ -105,10 +100,9 @@ class NodeVisitor:
             raise ValueError(f"axis {node.name} needs {extent} threads but only {launched} are launched")
         if extent < launched:             # surplus threads -> emit guard
             pred = ctx.new_pred()
-            self.block_cnt += 1
-            self.curr_block = f"block{self.block_cnt}"
-            self._emit(PTXInstr(PTXOpTy.IF, (pid, extent - 1), pred,
-                                {"cond": COND.GT, "dtype": pid.dtype}))
+            self.bman.new_block()
+            self.bman.curr_block.guard = PTXInstr(PTXOpTy.IF, (pid, extent - 1), pred,
+                                        {"cond": COND.GT, "dtype": pid.dtype})
 
     # mem ---------------------------------------------------------------------------
 
@@ -185,7 +179,75 @@ class NodeVisitor:
     # not supported yet
 
     def visit_StridedLoop(self, node):
-        raise NotImplementedError("see next version")
-    
+        start = self.visit(node.start)
+        end = node.axis.extent.value
+        var_name = node.axis.name
+        step = self.visit(node.step)
+
+        var_reg = self.ctx.new_reg(start.dtype)
+        self._emit(PTXInstr(PTXOpTy.MOV, (start), var_reg))
+        self.ctx.name_to_reg[var_name] = var_reg
+
+        self.bman.new_block() # loop:
+        self.bman.new_block() # loop end:
+        pred = self.ctx.new_pred()
+        self.bman.curr_block.guard = PTXInstr(PTXOpTy.LOOP, (var_reg, step, end), pred, {"cond": COND.GE, "dtype" : start.dtype})
+
+        self.visit(node.body)
+        self._emit(PTXInstr(PTXOpTy.ADD, (var_reg, step), var_reg))
+        self.bman.new_block() 
+
+
+
+    def visit_WarpShuffle(self, node):
+        var_nm = node.state[0]
+        var_reg = self.ctx.name_to_reg[var_nm]
+
+        out_var = node.state_b
+        out_var_reg =self.ctx.new_reg("u32")
+        self.ctx.name_to_reg[out_var] = out_var_reg
+
+        idx = node.length // 2
+        while (idx >= 1):
+            self._emit(PTXInstr(PTXOpTy.MOV, (var_reg,), (out_var_reg)))
+            store_reg =self.ctx.new_reg("f32")
+            self._emit(PTXInstr(PTXOpTy.SHFL, (out_var_reg, idx), (store_reg), {"c" : "0x1f", "mask": "0xffffffff"}))
+            int_to_float_reg =self.ctx.new_reg("f32")
+            self._emit(PTXInstr(PTXOpTy.MOV, (store_reg,), int_to_float_reg))
+            self._emit(PTXInstr(PTXOpTy.ADD, (var_reg, int_to_float_reg), (var_reg)))
+            idx //= 2
+
     def visit_Accum(self, node):
-        raise NotImplementedError("see next version")
+
+        acc_nm = node.name
+        rhs = self.ctx.name_to_reg[node.value]
+        op = ELEMENTWISE_OPS[node.op.name]
+        dtype = self.visit(node.dtype)
+
+        prev_block = self.bman.get_prev_block(2)
+        acc_reg = self.ctx.new_reg("f32")
+        self.ctx.name_to_reg[acc_nm] = acc_reg
+        prev_block.add(PTXInstr(PTXOpTy.MOV, (0.0,), acc_reg))
+
+        self._emit(PTXInstr(op, (acc_reg, rhs), acc_reg))
+
+    def visit_Smem(self, node):
+        name = node.name
+        size = node.extents
+        dtype = node.dtype
+        align = node.align
+
+        smem_instr = Smem(name, size, dtype, align)
+        self.ctx.smem_instr.append(smem_instr)
+
+    def visit_Cond(self, node):
+        print(node)
+
+        self.bman.new_block() # loop:
+        guard = self.visit(node.cond)
+        self.bman.curr_block.guard = guard
+        self.visit(node.body)
+
+        
+        
+        import sys; sys.exit(0)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from ptx_builder import render_blocks
+from utils import _nbytes
 
 PTX_VERSION = "8.0"
 PTX_TARGET = "sm_89"
@@ -7,12 +8,12 @@ PTX_TARGET = "sm_89"
 # register class prefix, type used in its .reg declaration
 REG_DECL_TYPE = {"f": "f32", "fd": "f64", "r": "b32", "rd": "b64", "p": "pred"}
 
-
+PY_TYPE_TO_PTX = {"float" : "f32"}
 class Emitter:
-    def __init__(self, ctx, mstruct, blocks):
+    def __init__(self, ctx, mstruct, blockManager):
         self.ctx = ctx
         self.mstruct = mstruct
-        self.blocks = blocks
+        self.blockManager = blockManager
 
     def emit(self) -> str:
         name = self.mstruct.kernel_name
@@ -21,15 +22,25 @@ class Emitter:
             f".target {PTX_TARGET}",
             ".address_size 64",
             "",
+            f"{self._smem()}",
             f".visible .entry {name}(",
             self._params(name),
             ")",
             "{",
             *self._reg_decls(),
             *self._load_params(name),
-            render_blocks(self.blocks),
+            render_blocks(self.blockManager),
             "}",
         ])
+
+    def _smem(self) -> str:
+        ret = ""
+        for smem in self.ctx.smem_instr:
+            dtype = PY_TYPE_TO_PTX[smem.dtype]
+            align = max(_nbytes(dtype), smem.align)
+            ret += f".shared .align {align} .{dtype} {smem.nm}[{smem.size[0]}];\n"
+
+        return ret
 
     def _params(self, name: str) -> str:
         return ",\n".join(f"\t.param .u64 {name}_param_{i}" for i in range(self.mstruct.num_args))

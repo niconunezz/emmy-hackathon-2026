@@ -20,7 +20,7 @@ def compile_kernel(ir_path: Path) -> str:
     ctx = PTXAssembly(meta.signature)
     visitor = NodeVisitor(ctx, meta)
     visitor.visit(list(graph.nodes.values()))
-    return Emitter(ctx, meta, visitor.ins).emit()
+    return Emitter(ctx, meta, visitor.bman).emit()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compile an Emmy kernel IR to PTX.")
