@@ -30,8 +30,8 @@ _SIMPLE_OPS: dict[PTXOpTy, Callable[..., str]] = {
     PTXOpTy.ADD:  lambda ins, out, dtype, args: f"add.{dtype} {out}, {ins[0]}, {ins[1]};",
     PTXOpTy.RELU: lambda ins, out, dtype, args: f"max.{dtype} {out}, 0f00000000, {ins[0]};",
     PTXOpTy.MOV: lambda ins, out, dtype, args: f"mov.{dtype} {out}, {ins[0]};",
-    PTXOpTy.SHFL: _emit_shfl,
-}
+    PTXOpTy.SHFL: _emit_shfl}
+
 def _emit_pid(instr: PTXInstr) -> list[str]:
     ctaid, ntid, tid, lane, warp= (r.nm for r in instr.ins)
     return [f"mov.u32 {ctaid}, %ctaid.x;",
@@ -42,15 +42,24 @@ def _emit_pid(instr: PTXInstr) -> list[str]:
             f"shr.u32 {warp}, {ctaid}, 5;"]
 
 def _emit_load(instr: PTXInstr) -> str:
-    return f"ld.global.{instr.outs.dtype} {instr.outs.nm}, [{instr.ins[0].nm}];"
+
+    if instr.args.get("smem", None):
+        ty = "smem"
+    else:
+        ty = "global"
+    return f"ld.{ty}.{instr.outs.dtype} {instr.outs.nm}, [{instr.ins[0].nm}];"
 
 def _emit_store(instr: PTXInstr) -> str:
     address, values = instr.ins
     dtype = values[0].dtype
     names = ", ".join(v.nm for v in values)
+    if instr.args.get("smem", None):
+        ty = "smem"
+    else:
+        ty = "global"
     if len(values) == 1:
-        return f"st.global.{dtype} [{address.nm}], {names};"
-    return f"st.global.v{len(values)}.{dtype} [{address.nm}], {{{names}}};"
+        return f"st.{ty}.{dtype} [{address.nm}], {names};"
+    return f"st.{ty}.v{len(values)}.{dtype} [{address.nm}], {{{names}}};"
 
 def _emit_guard(instr: PTXInstr, end_label: str) -> list[str]:
     lhs, rhs = instr.ins
@@ -58,6 +67,8 @@ def _emit_guard(instr: PTXInstr, end_label: str) -> list[str]:
     return [f"setp.{cmp}.{instr.args['dtype']} {instr.outs.nm}, {_operand(lhs)}, {_operand(rhs)};",
             f"@{instr.outs.nm} bra {end_label};"]
 
+def _emit_sync(instr: PTXInstr):
+    return f"bar.sync {instr.ins[0]};"
 
 
 
@@ -68,6 +79,8 @@ def _emit_instr(instr: PTXInstr) -> list[str]:
         return [_emit_load(instr)]
     if instr.op_type is PTXOpTy.STORE:
         return [_emit_store(instr)]
+    if instr.op_type is PTXOpTy.SYNC:
+        return [_emit_sync(instr)]
     handler = _SIMPLE_OPS.get(instr.op_type)
     if handler is None:
         raise NotImplementedError(f"cannot render {instr.op_type.name}")

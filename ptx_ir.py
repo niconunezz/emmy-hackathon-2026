@@ -17,6 +17,7 @@ class PTXOpTy(Enum):
     LOOP = auto()
     BRANCH = auto()
     SHFL = auto()
+    SYNC = auto()
 
 class COND(Enum):
     GT = auto()

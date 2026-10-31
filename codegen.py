@@ -1,6 +1,6 @@
 from __future__ import annotations
 from ptx_builder import render_blocks
-from utils import _nbytes
+from utils import _nbytes, PY_TYPE_TO_PTX
 
 PTX_VERSION = "8.0"
 PTX_TARGET = "sm_89"
@@ -8,7 +8,6 @@ PTX_TARGET = "sm_89"
 # register class prefix, type used in its .reg declaration
 REG_DECL_TYPE = {"f": "f32", "fd": "f64", "r": "b32", "rd": "b64", "p": "pred"}
 
-PY_TYPE_TO_PTX = {"float" : "f32"}
 class Emitter:
     def __init__(self, ctx, mstruct, blockManager):
         self.ctx = ctx

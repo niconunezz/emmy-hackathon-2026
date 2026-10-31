@@ -9,3 +9,4 @@ def _nbytes(dtype: str) -> int:
 
 
 LITERAL_DTYPE = {int: "u32", float: "f32"}
+PY_TYPE_TO_PTX = {"float" : "f32"}

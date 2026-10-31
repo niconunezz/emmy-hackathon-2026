@@ -3,14 +3,13 @@ import logging
 from collections import defaultdict
 from meta import MetaStruct
 from ptx_ir import COND, PTXAssembly, PTXInstr, PTXOpTy, Register, Smem, BlockManager
-from utils import _nbytes, LITERAL_DTYPE
+from utils import _nbytes, LITERAL_DTYPE, PY_TYPE_TO_PTX
 
 log = logging.getLogger(__name__)
 
-# note for COND methods we use the inverse because of how we create blocks
-BIN_OPS = {"+": PTXOpTy.ADD, "*": PTXOpTy.MUL, "==" : COND.NE}
+BIN_OPS = {"+": PTXOpTy.ADD, "*": PTXOpTy.MUL}
 ELEMENTWISE_OPS = {"add": PTXOpTy.ADD, "multiply": PTXOpTy.MUL, "relu": PTXOpTy.RELU}
-
+INV_COND_OPS = {"==" : COND.NE}
 
 def dtype_from_bin_expr(lhs, rhs) -> str:
     lhs_dtype = _dtype_of(lhs)
@@ -108,6 +107,8 @@ class NodeVisitor:
 
     def _index_of(self, node):
         idx = self.visit(node.index)
+        if len(idx) == 0:
+            return 0
         if len(idx) != 1:
             raise NotImplementedError(f"only 1-D indexing is supported, got {len(idx)} indices")
         return idx[0]
@@ -136,14 +137,20 @@ class NodeVisitor:
         address = self._element_address(ptr, idx, dtype)
         value = self.ctx.new_reg(dtype)
         self.ctx.name_to_reg[node.name] = value
-        self._emit(PTXInstr(PTXOpTy.LOAD, (address,), value))
+        self._emit(PTXInstr(PTXOpTy.LOAD, (address,), value, {}))
 
     def visit_Write(self, node):
+        for n in node.values:
+            print(f"name : {n}")
         values = [self.ctx.name_to_reg[n] for n in node.values]
         ptr = self.ctx.name_to_reg[node.output]
+        if isinstance(ptr, str):
+            smem = True
+        else:
+            smem = False
         idx = self._index_of(node)
         address = self._element_address(ptr, idx, values[0].dtype)
-        self._emit(PTXInstr(PTXOpTy.STORE, (address, values), None))
+        self._emit(PTXInstr(PTXOpTy.STORE, (address, values), None, {"smem" : smem}))
 
     # arith ops ------------------------------
 
@@ -238,16 +245,51 @@ class NodeVisitor:
         align = node.align
 
         smem_instr = Smem(name, size, dtype, align)
+        # manually create smem reg
+        self.ctx.name_to_reg[name] = Register(name, PY_TYPE_TO_PTX[dtype])
         self.ctx.smem_instr.append(smem_instr)
 
     def visit_Cond(self, node):
         print(node)
 
+        cond = node.cond
+        lhs = self.visit(cond.left)
+        rhs = self.visit(cond.right)
+        pred = self.ctx.new_pred()
+        guard = PTXInstr(PTXOpTy.IF, (lhs, rhs), pred, {"cond" : INV_COND_OPS[cond.op],
+                                                        "dtype" : lhs.dtype})
         self.bman.new_block() # loop:
-        guard = self.visit(node.cond)
         self.bman.curr_block.guard = guard
         self.visit(node.body)
+        # self.bman.new_block() # loop:
 
-        
-        
-        import sys; sys.exit(0)
+    def visit_Sync(self, node):
+
+        bar_id = node.barrier_id
+        self._emit(PTXInstr(PTXOpTy.SYNC, (bar_id, ), None))
+    
+    def visit_TreeHalve(self, node):
+        print(node)
+        buf_nm = node.bufs[0]
+        buf_reg = self.ctx.name_to_reg[buf_nm]
+        length = node.length
+        acc_nm = node.state[0]
+        # state_b = node.state_b
+
+        ptr_reg = self.ctx.new_reg(buf_reg.dtype)
+        self._emit(PTXInstr(PTXOpTy.MOV, (buf_reg,), ptr_reg))
+
+        ld_regs = [self.ctx.new_reg(buf_reg.dtype) for _ in range(length)]
+        assert(_is_power_of_two(length)), f"length must be a power of two"
+        for i in range(length):
+            out_reg = self.ctx.new_reg(buf_reg.dtype)
+            self._emit(PTXInstr(PTXOpTy.ADD, (ptr_reg, length*i), out_reg))
+            self._emit(PTXInstr(PTXOpTy.LOAD, (out_reg,), ld_regs[i], {"smem" : True}))
+        while (length > 1):
+            length //= 2
+            tmp_regs = [self.ctx.new_reg(buf_reg.dtype) for _ in range(length)]
+            if length == 1:
+                self.ctx.name_to_reg[acc_nm] = tmp_regs[0]
+            for i in range(length):
+                self._emit(PTXInstr(PTXOpTy.ADD, (ld_regs[i*2], ld_regs[(i*2)+1]), tmp_regs[i], {"smem" : True}))
+            ld_regs = tmp_regs
