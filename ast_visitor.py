@@ -8,7 +8,7 @@ from utils import _nbytes, LITERAL_DTYPE, PY_TYPE_TO_PTX
 log = logging.getLogger(__name__)
 
 BIN_OPS = {"+": PTXOpTy.ADD, "*": PTXOpTy.MUL}
-ELEMENTWISE_OPS = {"add": PTXOpTy.ADD, "multiply": PTXOpTy.MUL, "relu": PTXOpTy.RELU}
+ELEMENTWISE_OPS = {"add": PTXOpTy.ADD, "multiply": PTXOpTy.MUL, "relu": PTXOpTy.RELU, "divide": PTXOpTy.DIV}
 INV_COND_OPS = {"==" : COND.NE}
 
 def dtype_from_bin_expr(lhs, rhs) -> str:
@@ -56,14 +56,26 @@ class NodeVisitor:
         return self.visit(node.op)
 
     def visit_InputOp(self, node):
+        return None
+
+    def visit_ConstantOp(self, node):
         return None          
 
     def visit_KernelOp(self, node):
         return self.visit(node.body)
 
     def visit_Tile(self, node):
-        self.visit(node.axes)
+        has_guard = self.visit(node.axes)
         self.visit(node.body)
+        if (has_guard):
+            self.bman.new_block()
+
+    # def visit_ConstantOp(self, node):
+    #     print(node)
+    #     nm = node.name
+    #     value = node.value
+    #     print(f"self.bman.curr_block : {self.bman.curr_block.name}")
+    #     import sys; sys.exit(0)
 
     # leaves --------------------------------------
 
@@ -99,21 +111,24 @@ class NodeVisitor:
             raise ValueError(f"axis {node.name} needs {extent} threads but only {launched} are launched")
         if extent < launched:             # surplus threads -> emit guard
             pred = ctx.new_pred()
-            self.bman.new_block()
-            self.bman.curr_block.guard = PTXInstr(PTXOpTy.IF, (pid, extent - 1), pred,
-                                        {"cond": COND.GT, "dtype": pid.dtype})
+            self._emit(PTXInstr(PTXOpTy.IF, (pid, extent - 1), pred,
+                                {"cond": COND.GT, "dtype": pid.dtype}))
+            return True
+
+        return False
 
     # mem ---------------------------------------------------------------------------
 
     def _index_of(self, node):
-        idx = self.visit(node.index)
-        if len(idx) == 0:
+        indices = self.visit(node.index)
+        if len(indices) == 0:
             return 0
-        if len(idx) != 1:
-            raise NotImplementedError(f"only 1-D indexing is supported, got {len(idx)} indices")
-        return idx[0]
+        if len(indices) == 1:
+            return indices[0]
+        
+        return indices
 
-    def _element_address(self, ptr: Register, idx, dtype: str) -> Register:
+    def _element_address(self, ptr: Register, indices, dtype: str, shape, smem: bool = False) -> Register:
         # ptr + idx * sizeof(dtype)
 
         nbytes = _nbytes(dtype)
@@ -125,31 +140,50 @@ class NodeVisitor:
             self._emit(PTXInstr(PTXOpTy.ADD, (ptr, offset), address))
             return address
         idx_bytes = self.ctx.new_reg(dtype_from_bin_expr(ptr, idx))
-        self._emit(PTXInstr(PTXOpTy.MUL, (idx, nbytes), idx_bytes, {"wide": True}))
+        wide = True if not smem else False
+        self._emit(PTXInstr(PTXOpTy.MUL, (idx, nbytes), idx_bytes, {"wide": wide}))
         address = self.ctx.new_reg(dtype_from_bin_expr(ptr, idx_bytes))
         self._emit(PTXInstr(PTXOpTy.ADD, (ptr, idx_bytes), address))
+        # -------------------------------------------------------------------------------
+
+        idx_bytes = self.ctx.new_reg(dtype_from_bin_expr(ptr, indices[0]))
+
+        assert(len(indices) == len(shape)), "indices must match the shape"
+        for i, idx in enumerate(indices[:-1]):
+            num_prods = len(shape) - (i + 1)
+            mul_regs = [self.ctx.new_reg(dtype_from_bin_expr(ptr, idx)) for _ in range(num_prods)]
+            add_regs = [self.ctx.new_reg(dtype_from_bin_expr(ptr, idx)) for _ in range(num_prods)]
+
+            for j in range(num_prods):
+                self._emit(PTXInstr(PTXOpTy.MUL, (idx, shape[i+1]), mul_regs[j], {"wide": wide}))
+                add_var = ptr if ((i == 0) and (j == 0)) else add_regs[j]
+                self._emit(PTXInstr(PTXOpTy.ADD, (add_var, mul_regs[j]), add_regs[j]))
+
         return address
 
     def visit_Load(self, node):
         ptr = self.ctx.name_to_reg[node.input]
+        shape = self.mstruct.signature[node.input]
         idx = self._index_of(node)
         dtype = self.visit(node.dtype)
-        address = self._element_address(ptr, idx, dtype)
+        address = self._element_address(ptr, idx, dtype, shape)
         value = self.ctx.new_reg(dtype)
         self.ctx.name_to_reg[node.name] = value
         self._emit(PTXInstr(PTXOpTy.LOAD, (address,), value, {}))
+        import sys; sys.exit(0)
 
     def visit_Write(self, node):
-        for n in node.values:
-            print(f"name : {n}")
         values = [self.ctx.name_to_reg[n] for n in node.values]
+        shape = self.mstruct.signature[node.output]
         ptr = self.ctx.name_to_reg[node.output]
-        if isinstance(ptr, str):
+
+        if "smem" in node.output:
             smem = True
         else:
             smem = False
         idx = self._index_of(node)
-        address = self._element_address(ptr, idx, values[0].dtype)
+        address = self._element_address(ptr, idx, values[0].dtype, shape, smem=True)
+
         self._emit(PTXInstr(PTXOpTy.STORE, (address, values), None, {"smem" : smem}))
 
     # arith ops ------------------------------
@@ -195,15 +229,13 @@ class NodeVisitor:
         self._emit(PTXInstr(PTXOpTy.MOV, (start), var_reg))
         self.ctx.name_to_reg[var_name] = var_reg
 
-        self.bman.new_block() # loop:
         self.bman.new_block() # loop end:
         pred = self.ctx.new_pred()
-        self.bman.curr_block.guard = PTXInstr(PTXOpTy.LOOP, (var_reg, step, end), pred, {"cond": COND.GE, "dtype" : start.dtype})
+        self._emit(PTXInstr(PTXOpTy.LOOP, (var_reg, step, end), pred, {"cond": COND.GE, "dtype" : start.dtype}))
 
         self.visit(node.body)
         self._emit(PTXInstr(PTXOpTy.ADD, (var_reg, step), var_reg))
         self.bman.new_block() 
-
 
 
     def visit_WarpShuffle(self, node):
@@ -216,11 +248,11 @@ class NodeVisitor:
 
         idx = node.length // 2
         while (idx >= 1):
-            self._emit(PTXInstr(PTXOpTy.MOV, (var_reg,), (out_var_reg)))
+            self._emit(PTXInstr(PTXOpTy.MOV, (var_reg,), (out_var_reg), {"interpret_bits" : True}))
             store_reg =self.ctx.new_reg("f32")
             self._emit(PTXInstr(PTXOpTy.SHFL, (out_var_reg, idx), (store_reg), {"c" : "0x1f", "mask": "0xffffffff"}))
             int_to_float_reg =self.ctx.new_reg("f32")
-            self._emit(PTXInstr(PTXOpTy.MOV, (store_reg,), int_to_float_reg))
+            self._emit(PTXInstr(PTXOpTy.MOV, (store_reg,), int_to_float_reg, {"interpret_bits" : True}))
             self._emit(PTXInstr(PTXOpTy.ADD, (var_reg, int_to_float_reg), (var_reg)))
             idx //= 2
 
@@ -231,10 +263,10 @@ class NodeVisitor:
         op = ELEMENTWISE_OPS[node.op.name]
         dtype = self.visit(node.dtype)
 
-        prev_block = self.bman.get_prev_block(2)
+        prev_block = self.bman.get_prev_block()
         acc_reg = self.ctx.new_reg("f32")
         self.ctx.name_to_reg[acc_nm] = acc_reg
-        prev_block.add(PTXInstr(PTXOpTy.MOV, (0.0,), acc_reg))
+        prev_block.add(PTXInstr(PTXOpTy.MOV, (0.0,), acc_reg, {}))
 
         self._emit(PTXInstr(op, (acc_reg, rhs), acc_reg))
 
@@ -246,11 +278,14 @@ class NodeVisitor:
 
         smem_instr = Smem(name, size, dtype, align)
         # manually create smem reg
-        self.ctx.name_to_reg[name] = Register(name, PY_TYPE_TO_PTX[dtype])
-        self.ctx.smem_instr.append(smem_instr)
+        ty = PY_TYPE_TO_PTX[dtype]
+        smem_reg = Register(name, ty)
+        smem_ptr_reg = self.ctx.new_reg("u32")
+        self.ctx.name_to_reg[name] = smem_ptr_reg
+        self._emit(PTXInstr(PTXOpTy.MOV, smem_reg, smem_ptr_reg))
+        self.ctx.smem_instr[name] = smem_instr
 
     def visit_Cond(self, node):
-        print(node)
 
         cond = node.cond
         lhs = self.visit(cond.left)
@@ -258,10 +293,9 @@ class NodeVisitor:
         pred = self.ctx.new_pred()
         guard = PTXInstr(PTXOpTy.IF, (lhs, rhs), pred, {"cond" : INV_COND_OPS[cond.op],
                                                         "dtype" : lhs.dtype})
-        self.bman.new_block() # loop:
-        self.bman.curr_block.guard = guard
+        self._emit(guard)
         self.visit(node.body)
-        # self.bman.new_block() # loop:
+        self.bman.new_block() # loop:
 
     def visit_Sync(self, node):
 
@@ -269,25 +303,22 @@ class NodeVisitor:
         self._emit(PTXInstr(PTXOpTy.SYNC, (bar_id, ), None))
     
     def visit_TreeHalve(self, node):
-        print(node)
         buf_nm = node.bufs[0]
-        buf_reg = self.ctx.name_to_reg[buf_nm]
+        smem_obj = self.ctx.smem_instr[buf_nm]
+        smem_ty = PY_TYPE_TO_PTX[smem_obj.dtype]
+        ptr_reg = self.ctx.name_to_reg[buf_nm]
         length = node.length
         acc_nm = node.state[0]
-        # state_b = node.state_b
 
-        ptr_reg = self.ctx.new_reg(buf_reg.dtype)
-        self._emit(PTXInstr(PTXOpTy.MOV, (buf_reg,), ptr_reg))
-
-        ld_regs = [self.ctx.new_reg(buf_reg.dtype) for _ in range(length)]
+        ld_regs = [self.ctx.new_reg(smem_ty) for _ in range(length)]
         assert(_is_power_of_two(length)), f"length must be a power of two"
         for i in range(length):
-            out_reg = self.ctx.new_reg(buf_reg.dtype)
+            out_reg = self.ctx.new_reg(ptr_reg.dtype)
             self._emit(PTXInstr(PTXOpTy.ADD, (ptr_reg, length*i), out_reg))
             self._emit(PTXInstr(PTXOpTy.LOAD, (out_reg,), ld_regs[i], {"smem" : True}))
         while (length > 1):
             length //= 2
-            tmp_regs = [self.ctx.new_reg(buf_reg.dtype) for _ in range(length)]
+            tmp_regs = [self.ctx.new_reg(smem_ty) for _ in range(length)]
             if length == 1:
                 self.ctx.name_to_reg[acc_nm] = tmp_regs[0]
             for i in range(length):

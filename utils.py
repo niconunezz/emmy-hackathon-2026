@@ -1,6 +1,6 @@
 from ptx_ir import Register
 
-DTYPE_BYTES = {"f32": 4}
+DTYPE_BYTES = {"f32": 4, "u32": 4}
 def _nbytes(dtype: str) -> int:
     try:
         return DTYPE_BYTES[dtype]

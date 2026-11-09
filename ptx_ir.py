@@ -10,6 +10,7 @@ class PTXOpTy(Enum):
     STORE = auto()
     ADD = auto()
     MUL = auto()
+    DIV = auto()
     SHL = auto()
     RELU = auto()
     IF = auto()     
@@ -40,13 +41,12 @@ class PTXInstr(NamedTuple):
     op_type: PTXOpTy
     ins: Sequence[Any]
     outs: Optional[Register]
-    args: Optional[dict] = None
+    args: Optional[dict] = {}
 
 class Block:
     def __init__(self, name, id):
         self.name : str = name
         self.id : int = id
-        self.guard : PTXInstr|None = None
         self.ins : list = []
 
     def add(self, instr: PTXInstr):
@@ -59,7 +59,10 @@ class BlockManager:
         self.curr_block = init_block
         self.blocks = [init_block]
         self.n_blocks = len(self.blocks)
-        
+
+    def close_block(self):
+        ...
+    
     def new_block(self):
         new_id = self.blocks[-1].id + 1
         new_nm = "BLOCK" + str(new_id)
@@ -103,15 +106,17 @@ class PTXAssembly:
         # with loops or several guarded blocks a cached register may not dominate its reuse.
         self.bin_expr_cache: dict = {}
         self.name_to_reg = self._init_params(signature)
-        self.smem_instr : List[Smem] = [] 
+        self.smem_instr : dict = {} 
 
     def _init_params(self, signature: dict[str, str]) -> dict[str, Register]:
         # %rd0 to %rdN-1 are scratch registers for ld.param
-        for dtype in signature.values():
-            self.new_reg(dtype)
+        for param in signature.values():
+            self.new_reg(param.dtype)
         # the next N hold the cvta.to.global result of each kernel argument.
-        return {name: self.new_reg(dtype) for name, dtype in signature.items()}
+        names = list(signature.keys())
+        dtypes = [p.dtype for p in signature.values()]
 
+        return {name: self.new_reg(dtype) for name, dtype in zip(names, dtypes)}
     
 
     def _alloc(self, prefix: str, dtype: str) -> Register:

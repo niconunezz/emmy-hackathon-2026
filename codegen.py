@@ -34,7 +34,7 @@ class Emitter:
 
     def _smem(self) -> str:
         ret = ""
-        for smem in self.ctx.smem_instr:
+        for smem in self.ctx.smem_instr.values():
             dtype = PY_TYPE_TO_PTX[smem.dtype]
             align = max(_nbytes(dtype), smem.align)
             ret += f".shared .align {align} .{dtype} {smem.nm}[{smem.size[0]}];\n"

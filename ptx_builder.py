@@ -22,14 +22,23 @@ def _emit_shfl(ins, out, dtype, args):
     c = args['c']
     mask = args['mask']
 
-    return f"shfl.sync.bfly.{dtype}\t{_operand(out)}, {_operand(a)}, {_operand(b)}, {c}, {mask};"
+    return f"shfl.sync.bfly.b32\t{_operand(out)}, {_operand(a)}, {_operand(b)}, {c}, {mask};"
+
+def _emit_mov(ins, out, dtype, args):
+    interpret = args.get("interpret_bits", False)
+    if interpret:
+        bits = dtype[-2:]
+        return f"mov.b{bits} {out}, {ins[0]};"
+    
+    return f"mov.{dtype} {out}, {ins[0]};"
 
 _SIMPLE_OPS: dict[PTXOpTy, Callable[..., str]] = {
     PTXOpTy.MUL:  _mul,
     PTXOpTy.SHL:  lambda ins, out, dtype, args: f"shl.b32 {out}, {ins[0]}, {ins[1]};",
     PTXOpTy.ADD:  lambda ins, out, dtype, args: f"add.{dtype} {out}, {ins[0]}, {ins[1]};",
     PTXOpTy.RELU: lambda ins, out, dtype, args: f"max.{dtype} {out}, 0f00000000, {ins[0]};",
-    PTXOpTy.MOV: lambda ins, out, dtype, args: f"mov.{dtype} {out}, {ins[0]};",
+    PTXOpTy.DIV : lambda ins, out, dtype, args: f"div.rn.{dtype} {out}, {ins[0]}, {ins[1]};",
+    PTXOpTy.MOV: _emit_mov,
     PTXOpTy.SHFL: _emit_shfl}
 
 def _emit_pid(instr: PTXInstr) -> list[str]:
@@ -38,13 +47,13 @@ def _emit_pid(instr: PTXInstr) -> list[str]:
             f"mov.u32 {ntid}, %ntid.x;",
             f"mov.u32 {tid}, %tid.x;",
             f"mad.lo.s32 {instr.outs.nm}, {ctaid}, {ntid}, {tid};",
-            f"and.b32 {lane}, {ctaid}, 31;",
-            f"shr.u32 {warp}, {ctaid}, 5;"]
+            f"and.b32 {lane}, {tid}, 31;",
+            f"shr.u32 {warp}, {tid}, 5;"]
 
 def _emit_load(instr: PTXInstr) -> str:
 
     if instr.args.get("smem", None):
-        ty = "smem"
+        ty = "shared"
     else:
         ty = "global"
     return f"ld.{ty}.{instr.outs.dtype} {instr.outs.nm}, [{instr.ins[0].nm}];"
@@ -54,7 +63,7 @@ def _emit_store(instr: PTXInstr) -> str:
     dtype = values[0].dtype
     names = ", ".join(v.nm for v in values)
     if instr.args.get("smem", None):
-        ty = "smem"
+        ty = "shared"
     else:
         ty = "global"
     if len(values) == 1:
@@ -98,28 +107,28 @@ def render_blocks(blockManager) -> str:
     for i, block in enumerate(blockManager.blocks):
         instrs = block.ins
         name = block.name
-        print(f"block.name : {block.name}")
-        print(f"instrs:  {instrs}")
-        guard = block.guard
-        if guard is not None:
-            print(f"guard : {guard}")
-            if guard.op_type is PTXOpTy.IF:
-                lines += _emit_guard(guard, end_label=name)
-            elif guard.op_type is PTXOpTy.LOOP:
-                var_reg, step, end = guard.ins
-                pred = guard.outs
-                stop_cond = PTXInstr(PTXOpTy.IF, (var_reg, end), pred, guard.args)
+
+        guard = None
+        for instr in instrs:
+            if instr.op_type is PTXOpTy.IF:
+                guard = instr
+                lines += _emit_guard(instr, end_label=name)
+
+            elif instr.op_type is PTXOpTy.LOOP:
+                guard = instr
+                var_reg, step, end = instr.ins
+                pred = instr.outs
+                stop_cond = PTXInstr(PTXOpTy.IF, (var_reg, end), pred, instr.args)
                 lines += _emit_guard(stop_cond, end_label=name)
             else:
-                raise ValueError(f"{name} must start with a guard, got {guard.op_type.name}")
-                
-        for instr in instrs:
-            lines += _emit_instr(instr)
+                lines += _emit_instr(instr)
 
         if (guard is not None) and (guard.op_type is PTXOpTy.LOOP):
             loop_block_name = blockManager.blocks[i-1].name
-            lines += [f"bra\t\t{loop_block_name}"]
-        if name != "BLOCK0":
+            lines += [f"bra\t\t{loop_block_name};"]
+
+        if (len(instrs) > 0):
             lines.append(f"{name}:")
+            
     lines.append("ret;")
     return "\n".join(l if l.endswith(":") else "\t" + l for l in lines) + "\n"
