@@ -131,55 +131,50 @@ class NodeVisitor:
     def _element_address(self, ptr: Register, indices, dtype: str, shape, smem: bool = False) -> Register:
         # ptr + idx * sizeof(dtype)
 
+        if isinstance(indices, Register):
+            indices = (indices,)
+    
+        assert(len(indices) == len(shape)), f"indices : {indices} with len {len(indices)} must match the shape : {shape}, with len {len(shape)}"
+
         nbytes = _nbytes(dtype)
-        if isinstance(idx, int):
-            offset = idx * nbytes
-            if offset == 0:
-                return ptr
-            address = self.ctx.new_reg(dtype_from_bin_expr(ptr, offset))
-            self._emit(PTXInstr(PTXOpTy.ADD, (ptr, offset), address))
-            return address
-        idx_bytes = self.ctx.new_reg(dtype_from_bin_expr(ptr, idx))
-        wide = True if not smem else False
-        self._emit(PTXInstr(PTXOpTy.MUL, (idx, nbytes), idx_bytes, {"wide": wide}))
-        address = self.ctx.new_reg(dtype_from_bin_expr(ptr, idx_bytes))
-        self._emit(PTXInstr(PTXOpTy.ADD, (ptr, idx_bytes), address))
-        # -------------------------------------------------------------------------------
-
         idx_bytes = self.ctx.new_reg(dtype_from_bin_expr(ptr, indices[0]))
+        acc_reg = self.ctx.new_reg(dtype_from_bin_expr(ptr, indices[0]))
+        self._emit(PTXInstr(PTXOpTy.MOV, (0.0, ), acc_reg))
 
-        assert(len(indices) == len(shape)), "indices must match the shape"
-        for i, idx in enumerate(indices[:-1]):
+        for i in range(len(indices)):
             num_prods = len(shape) - (i + 1)
-            mul_regs = [self.ctx.new_reg(dtype_from_bin_expr(ptr, idx)) for _ in range(num_prods)]
-            add_regs = [self.ctx.new_reg(dtype_from_bin_expr(ptr, idx)) for _ in range(num_prods)]
-
+            idx = indices[i]
             for j in range(num_prods):
-                self._emit(PTXInstr(PTXOpTy.MUL, (idx, shape[i+1]), mul_regs[j], {"wide": wide}))
-                add_var = ptr if ((i == 0) and (j == 0)) else add_regs[j]
-                self._emit(PTXInstr(PTXOpTy.ADD, (add_var, mul_regs[j]), add_regs[j]))
+                self._emit(PTXInstr(PTXOpTy.MUL, (idx, shape[i+j+1]), idx, {"wide": False}))
+            self._emit(PTXInstr(PTXOpTy.ADD, (acc_reg, indices[i]), acc_reg))
+        
+        wide = True if not smem else False
 
+        self._emit(PTXInstr(PTXOpTy.MUL, (acc_reg, nbytes), idx_bytes, {"wide": wide}))
+        address = self.ctx.new_reg(dtype_from_bin_expr(ptr, indices[0]))
+        self._emit(PTXInstr(PTXOpTy.ADD, (ptr, idx_bytes), address))
+        
         return address
 
     def visit_Load(self, node):
         ptr = self.ctx.name_to_reg[node.input]
-        shape = self.mstruct.signature[node.input]
+        shape = self.mstruct.signature[node.input].shape
         idx = self._index_of(node)
         dtype = self.visit(node.dtype)
         address = self._element_address(ptr, idx, dtype, shape)
         value = self.ctx.new_reg(dtype)
         self.ctx.name_to_reg[node.name] = value
         self._emit(PTXInstr(PTXOpTy.LOAD, (address,), value, {}))
-        import sys; sys.exit(0)
 
     def visit_Write(self, node):
         values = [self.ctx.name_to_reg[n] for n in node.values]
-        shape = self.mstruct.signature[node.output]
         ptr = self.ctx.name_to_reg[node.output]
-
+        
         if "smem" in node.output:
             smem = True
+            shape = self.ctx.smem_instr[node.output].size
         else:
+            shape = self.mstruct.signature[node.output].shape
             smem = False
         idx = self._index_of(node)
         address = self._element_address(ptr, idx, values[0].dtype, shape, smem=True)
