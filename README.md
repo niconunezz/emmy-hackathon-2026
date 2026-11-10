@@ -3,13 +3,6 @@
 A Python-based compiler prototype that lowers **Emmy Kernel IR** directly to NVIDIA **PTX assembly**. The project implements an IR-to-PTX compilation pipeline, including graph traversal, instruction lowering, virtual register management, control-flow generation, memory addressing, and kernel code generation.
 
 Developed as part of the **Emmy Hackathon 2026**, this project explores the implementation of a low-level GPU compiler backend without relying on Emmy's CUDA renderer or `nvcc` for code generation.
-
-## Overview
-
-The compiler takes serialized Emmy Kernel IR as input and translates supported operations into PTX assembly.
-
-Its main objective is to bridge a high-level GPU kernel representation and NVIDIA's low-level virtual instruction set, while explicitly managing the intermediate representation, execution flow, register usage, and memory operations.
-
 **Key areas of implementation:**
 
 - IR graph deserialization and visitor-based traversal.
@@ -101,26 +94,7 @@ The compiler includes lowering mechanisms for structured control flow:
 
 These mechanisms provide the foundation for translating nested execution structures into PTX control flow.
 
-### 4. Memory Addressing and Tensor Indexing
-
-The backend implements tensor address calculation using multidimensional indices and row-major layout information.
-
-For a tensor with dimensions \(D_0, D_1, \ldots, D_{n-1}\), the linear element offset is:
-
-\[
-\text{offset} =
-\sum_{i=0}^{n-1}
-\left(
-\text{index}_i
-\prod_{j=i+1}^{n-1} D_j
-\right)
-\]
-
-The resulting element offset is converted into a byte offset according to the element size and added to the base pointer.
-
-The implementation also includes optimizations for certain index expressions, such as replacing multiplication by powers of two with shift operations.
-
-### 5. GPU Reduction Primitives
+### 4. GPU Reduction Primitives
 
 The compiler contains lowering implementations for several reduction building blocks:
 
@@ -133,7 +107,7 @@ The compiler contains lowering implementations for several reduction building bl
 
 These primitives demonstrate how higher-level reduction operations can be decomposed into warp-level and block-level GPU execution mechanisms.
 
-### 6. Kernel Code Generation
+### 5. Kernel Code Generation
 
 The code-generation stage is responsible for assembling the complete PTX kernel:
 
@@ -183,23 +157,6 @@ python compile.py problems/p00_scalar_add/k_add_pointwise.ir.json > out.ptx
 
 The generated assembly is written to standard output. Diagnostic logging can be enabled with `--verbose`.
 
-### Validate a Workload
-
-Run the submission harness against an individual problem:
-
-```bash
-python submit.py p00_scalar_add --compiler ./compile.py
-```
-
-For a reduction workload:
-
-```bash
-python submit.py r01_array_sum --compiler ./compile.py
-```
-
-The runner assembles and executes the generated PTX using the launch configuration specified in `meta.json`, then compares the output against the reference data using the configured numerical tolerances.
-
-The server endpoint and target architecture can be configured through the corresponding `submit.py` arguments.
 
 ## Design Considerations
 
@@ -249,38 +206,3 @@ In particular:
 - The compiler does not implement a general physical register allocator or advanced optimization passes.
 
 The supported workload list describes the supplied inputs, not a claim that every workload has passed end-to-end validation on every target GPU.
-
-## Repository Structure
-
-```text
-.
-├── compile.py
-├── ast_visitor.py
-├── ptx_ir.py
-├── ptx_builder.py
-├── codegen.py
-├── meta.py
-├── utils.py
-├── submit.py
-├── docs/
-│   └── API.md
-├── examples/
-│   └── k_sum_1_reduce.ptx
-└── problems/
-    ├── p00_scalar_add/
-    ├── p01_vector_add/
-    ├── p02_scale_shift/
-    ├── p03_relu_mul/
-    ├── r01_array_sum/
-    ├── r02_big_sum/
-    ├── r03_mean/
-    └── r04_row_sum/
-```
-
-## Motivation
-
-GPU compiler development requires understanding both the semantics of intermediate representations and the hardware execution model.
-
-This project explores that boundary by implementing a compilation pipeline that translates high-level GPU kernel IR into low-level PTX assembly, with explicit handling of instructions, registers, control flow, memory addressing, and parallel reduction mechanisms.
-
-The goal is to build a deeper understanding of GPU code generation and the design decisions involved in implementing a compiler backend.
